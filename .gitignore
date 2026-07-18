@@ -1,7 +1,9 @@
 # Data (large CSVs — attach as release assets or use Git LFS)
+# sample/ is tracked (small excerpt + best model for quick-start)
 data/
 
-# Trained models and artifacts
+# Trained models and artifacts (full training output)
+# sample/ model files are tracked
 models/
 
 # Logs

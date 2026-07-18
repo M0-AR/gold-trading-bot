@@ -74,11 +74,27 @@ A reproducible walk-forward research pipeline for training PPO agents on XAUUSD 
 
 ## Quick start
 
+### Option A: Try it with sample data (no download needed)
+
+The repo includes a 1-month data sample and a pre-trained best model (fold 14: +39% return, Sharpe 4.46) so you can explore the pipeline immediately:
+
 ```bash
 pip install -r requirements.txt
+
+# View the sample model's equity chart
+open sample/ppo_H1_sl1-1.5-2_tp1-1.5-2-3_3000k_seed42_equity_insample_oos.html
+
+# Train a single fold on the sample data
+python train_ppo.py
+
+# The sample data is at:
+# sample/XAUUSD_1 Min_Bid_2025.11.csv          — Nov 2025 (27K M1 bars, ~2MB)
+# sample/ppo_H1_sl1-1.5-2_tp1-1.5-2-3_3000k_seed42.zip       — trained PPO model
+# sample/ppo_H1_sl1-1.5-2_tp1-1.5-2-3_3000k_seed42_vecnorm.pkl — observation normalizer
+# sample/fold_summary.json                      — fold metrics (return, Sharpe, PF, etc.)
 ```
 
-### Data
+### Option B: Full pipeline with your own data
 
 Place your M1 CSV in `data/`. The pipeline expects MT4/MT5-style format:
 
@@ -191,6 +207,7 @@ XAUUSD M1 data
 | `final_holdout_eval.py` | One-time holdout evaluation entry point |
 | `download_data.py` | Data download utilities |
 | `run_pipeline.py` | One-command pre-test pipeline |
+| `sample/` | Sample data (Nov 2025), best model (fold 14), equity chart, metrics |
 
 ## Requirements
 

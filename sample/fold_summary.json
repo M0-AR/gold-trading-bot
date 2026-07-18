@@ -1,0 +1,16 @@
+{
+  "fold": 14,
+  "train_start": "2009-11-20",
+  "train_end": "2014-11-07",
+  "test_start": "2015-06-02",
+  "test_end": "2015-11-20",
+  "val_return_pct": 18.179146567448214,
+  "val_profit_factor": 1.200538759822665,
+  "test_return_pct": 38.959318286263844,
+  "test_sharpe": 4.457986026689983,
+  "test_profit_factor": 1.4007556129265548,
+  "test_win_rate_pct": 53.21782178217822,
+  "test_max_dd_pct": -6.411881507589379,
+  "test_avg_r": 0.16594621717957517,
+  "test_n_trades": 404.0
+}
