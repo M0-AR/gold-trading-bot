@@ -236,7 +236,7 @@ If you use this pipeline in your research, please cite:
 @software{gold_rl_trading_2025,
   title  = {XAUUSD Reinforcement Learning Trading Pipeline},
   year   = {2025},
-  url    = {https://github.com/md-ar/Reinforcement_Trading_Part_2}
+  url    = {https://github.com/M0-AR/gold-trading-bot}
 }
 ```
 

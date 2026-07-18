@@ -3,10 +3,10 @@
 If you use this pipeline in your research, please cite:
 
 ```bibtex
-@software{gold_rl_trading_2025,
+@software{gold_rl_trading_2026,
   title  = {XAUUSD Reinforcement Learning Trading Pipeline},
   author = {M0-AR},
-  year   = {2025},
+  year   = {2026},
   url    = {https://github.com/M0-AR/gold-trading-bot}
 }
 ```
@@ -16,10 +16,10 @@ If you use this pipeline in your research, please cite:
 This work is based on the original pipeline by **ZiadFrancis**:
 
 ```bibtex
-@software{ziadfrancis_rl_trading_2024,
+@software{ziadfrancis_rl_trading_2025,
   title  = {Reinforcement Trading Part 2},
   author = {ZiadFrancis},
-  year   = {2024},
+  year   = {2025},
   url    = {https://github.com/ZiadFrancis/Reinforcement_Trading_Part_2}
 }
 ```
