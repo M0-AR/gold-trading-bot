@@ -320,11 +320,12 @@ def train(
     # n_envs > 1 uses SubprocVecEnv: near-linear speedup because env simulation
     # (not the network) is the bottleneck.  n_envs=4 on a quad-core CPU gives
     # ~3.5× faster wall-clock.  Requires the __main__ guard at the bottom.
-    # device="auto" picks CUDA if available; adds ~15–30% on the network side.
-    # With n_envs=4 + GPU, effective batch per update = n_steps*n_envs = 8192
-    # → increase batch_size to 512 or 1024 for better GPU utilisation.
+    # device="cpu" is ~1.2x faster than GPU for our small [128,64] MLP —
+    # matrix ops are below the ~1500×1500 crossover where GPU wins.
+    # See PyTorch issue #163576 and SB3 docs ("PPO is primarily intended
+    # to run on the CPU when not using a CNN policy").
     n_envs: int = 1,
-    device: str = "auto",
+    device: str = "cpu",
     # ────────────────────────────────────────────────────────────────────────
     reveal_test: bool = False,
     # Inject pre-built splits (used by train_walk_forward to train one fold).
@@ -334,9 +335,19 @@ def train(
     import torch
     from stable_baselines3 import PPO
 
+    # ── Thread tuning ────────────────────────────────────────────────────
+    # OMP/MKL caps prevent PyTorch from over-subscribing CPU cores during
+    # env stepping and data prep.  Does NOT affect GPU gradient compute.
+    import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "4")
+    _os.environ.setdefault("MKL_NUM_THREADS", "4")
+
     # ── Device selection ─────────────────────────────────────────────────────
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # CPU is ~1.2x faster than GPU for our [128,64] MLP (5600 params,
+    # batch=1024).  Matrix ops are below the ~1500×1500 crossover where
+    # GPU wins; SB3 warns "PPO is primarily intended to run on the CPU
+    # when not using a CNN policy."  OMP/MKL threads (set above) help
+    # both env stepping and CPU gradient compute.
     print(f"Device : {device}")
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
@@ -461,6 +472,14 @@ def train(
           f"ent={CFG.ppo_ent_coef}  epochs={CFG.ppo_n_epochs}  "
           f"target_kl={CFG.ppo_target_kl}  wd={CFG.ppo_weight_decay:g}  "
           f"net={list(CFG.ppo_net_arch)}")
+
+    # ── torch.compile for 1.5-2x gradient-update speedup ──────────────────
+    if hasattr(torch, "compile"):
+        try:
+            model.policy = torch.compile(model.policy, backend="inductor")
+            print("torch.compile : applied (backend=inductor)")
+        except Exception as exc:
+            print(f"torch.compile : skipped ({exc})")
 
     model.learn(total_timesteps=total_timesteps, callback=CallbackList([sync_cb, eval_cb]))
 
@@ -781,7 +800,7 @@ def train_walk_forward(
     dd_penalty: float = 1.0,
     n_envs: int = 4,                         # SubprocVecEnv workers (CPU). Each worker copies its
                                              # fold's M1 slice under Windows 'spawn'; drop to 2 if RAM-tight.
-    device: str = "auto",
+    device: str = "cpu",
 ):
     """Walk-forward validation + gated deployment.
 
@@ -930,11 +949,12 @@ def train_sliding_walk_forward(
     total_timesteps: int = 3_000_000,
     seed: int = 42,
     out_dir: str = "models",
-    train_episode_steps: int = 2048,
+    train_episode_steps: int = 4096,
     target_evals_per_fold: int = 20,
     dd_penalty: float = 0.8,
-    n_envs: int = 4,
-    device: str = "auto",
+    n_envs: int = 16,
+    device: str = "cpu",
+    start_fold: int = 1,
 ):
     """Sliding-window walk-forward that simulates periodic retraining.
 
@@ -986,9 +1006,73 @@ def train_sliding_walk_forward(
     test_equities: list[pd.DataFrame] = []
     test_trade_logs: list[pd.DataFrame] = []
 
+    # Resume support: load existing summary and equity data from prior folds.
+    summary_path = Path(out_dir) / "sliding_walk_forward_summary.csv"
+    stitched_path = Path(out_dir) / "sliding_oos_equity.csv"
+    _resume_running = CFG.initial_equity  # for stitching new folds onto prior equity
+    if start_fold > 1 and summary_path.exists():
+        prior_summary = pd.read_csv(summary_path)
+        summary_rows.extend(prior_summary.to_dict("records"))
+        print(f"  Loaded {len(prior_summary)} prior fold summaries from {summary_path}")
+    if start_fold > 1 and stitched_path.exists():
+        prior_equity = pd.read_csv(stitched_path)
+        if not prior_equity.empty and "equity" in prior_equity:
+            _resume_running = float(prior_equity["equity"].iloc[-1])
+            print(f"  Resuming equity chain from ${_resume_running:,.0f}")
+    # When no stitched CSV exists yet, recover prior folds from per-fold dirs.
+    if start_fold > 1 and not summary_path.exists():
+        sliding_dir = Path(out_dir) / "sliding"
+        for k_prior in range(1, start_fold):
+            prior_fold = sliding_dir / f"fold_{k_prior}"
+            te_csv = prior_fold / "test_equity.csv"
+            tr_csv = prior_fold / "test_trades.csv"
+            ri_path = prior_fold / "run_info.json"
+            if te_csv.exists() and ri_path.exists():
+                eq_df = pd.read_csv(te_csv)
+                test_equities.append(eq_df)
+                if tr_csv.exists():
+                    test_trade_logs.append(pd.read_csv(tr_csv))
+                # Reconstruct summary row from run_info + equity curve
+                import json as _json
+                ri = _json.loads(ri_path.read_text())
+                test_rep = full_report(eq_df, test_trade_logs[-1] if test_trade_logs else pd.DataFrame(),
+                                       initial_equity=CFG.initial_equity,
+                                       periods_per_year=CFG.periods_per_year)["value"].to_dict()
+                summary_rows.append({
+                    "fold": k_prior,
+                    "train_start": "—", "train_end": "—",
+                    "test_start": eq_df["timestamp"].iloc[0] if "timestamp" in eq_df else "—",
+                    "test_end": eq_df["timestamp"].iloc[-1] if "timestamp" in eq_df else "—",
+                    "val_return_pct": None, "val_profit_factor": None,
+                    "test_return_pct": test_rep.get("total_return_pct"),
+                    "test_sharpe": test_rep.get("sharpe_like"),
+                    "test_profit_factor": test_rep.get("profit_factor"),
+                    "test_win_rate_pct": test_rep.get("win_rate_pct"),
+                    "test_max_dd_pct": test_rep.get("max_drawdown_pct"),
+                    "test_avg_r": test_rep.get("avg_r"),
+                    "test_n_trades": test_rep.get("n_trades"),
+                })
+                # Update _resume_running to chain from last fold's equity
+                if "equity" in eq_df and not eq_df.empty:
+                    _resume_running = float(eq_df["equity"].iloc[-1])
+                print(f"  Fold {k_prior}: recovered test equity ({len(eq_df)} bars, "
+                      f"return={test_rep.get('total_return_pct'):+.1f}%)")
+        if summary_rows:
+            print(f"  Resumed {len(summary_rows)} prior fold(s) from fold dirs, "
+                  f"equity chain from ${_resume_running:,.0f}")
+
     for k, (tr, va, te) in enumerate(folds, start=1):
         fold_dir = str(Path(out_dir) / "sliding" / f"fold_{k}")
         eval_freq_k = max(25_000, total_timesteps // target_evals_per_fold)
+
+        # Resume support: skip folds before start_fold.
+        if k < start_fold:
+            if (Path(fold_dir) / "run_info.json").exists():
+                print(f"  Fold {k}: already completed, skipping")
+            else:
+                print(f"  Fold {k}: skipped (resuming from fold {start_fold})")
+            continue
+
         print(f"\n── Fold {k}/{n_folds}"
               f"  | train {len(tr):,}  val {len(va):,}  test {len(te):,} bars"
               f"  | TEST {te.index.min().date()}→{te.index.max().date()}  → {fold_dir}")
@@ -1029,6 +1113,11 @@ def train_sliding_walk_forward(
             "test_avg_r": test_rep.get("avg_r"),
             "test_n_trades": test_rep.get("n_trades"),
         })
+        # Persist per-fold test equity and trades for resume support.
+        if test_eq is not None and not test_eq.empty:
+            test_eq.to_csv(Path(fold_dir) / "test_equity.csv", index=False)
+        if test_trades is not None and not test_trades.empty:
+            test_trades.to_csv(Path(fold_dir) / "test_trades.csv", index=False)
         print(f"   fold {k} TEST: return={test_rep.get('total_return_pct'):+.1f}%  "
               f"PF={test_rep.get('profit_factor'):.2f}  "
               f"Sharpe={test_rep.get('sharpe_like'):+.2f}  "
@@ -1039,8 +1128,13 @@ def train_sliding_walk_forward(
     summary.to_csv(summary_path, index=False)
 
     # ── Stitch every fold's test window into one continuous OOS equity curve ──
-    running = CFG.initial_equity
+    running = _resume_running
     parts = []
+    # If resuming, prepend the prior stitched equity as the starting point.
+    if start_fold > 1 and stitched_path.exists():
+        prior_equity = pd.read_csv(stitched_path)
+        if not prior_equity.empty and "equity" in prior_equity:
+            parts.append(prior_equity["equity"].astype(float))
     for eq in test_equities:
         if eq is None or eq.empty or "equity" not in eq:
             continue
@@ -1091,9 +1185,170 @@ def train_sliding_walk_forward(
     return summary
 
 
+def _get_fold_data(fold_idx: int):
+    """Load data and extract a single fold by index (0-based) for single-fold mode.
+
+    Returns (m1, feature_cols, train_df, val_df, test_df, n_folds, fold_timesteps).
+    fold_timesteps is the budget for this specific fold (3M steps for all sliding folds).
+    """
+    m1, feat, feature_cols = _load_decision_features()
+    folds = make_sliding_folds(
+        feat,
+        train_years=CFG.sliding_train_years,
+        val_months=CFG.sliding_val_months,
+        test_months=CFG.sliding_test_months,
+        step_months=CFG.sliding_step_months,
+        embargo_bars=CFG.split_embargo_bars,
+    )
+    n_folds = len(folds)
+    if fold_idx < 0 or fold_idx >= n_folds:
+        raise ValueError(f"fold_idx {fold_idx} out of range (0..{n_folds - 1})")
+    tr, va, te = folds[fold_idx]
+    return m1, feature_cols, tr, va, te, n_folds
+
+
+def train_single_fold(
+    fold_num: int,
+    total_timesteps: int = 3_000_000,
+    seed: int = 42,
+    out_dir: str = "models",
+    train_episode_steps: int = 4096,
+    target_evals_per_fold: int = 20,
+    dd_penalty: float = 0.8,
+    n_envs: int = 4,
+    device: str = "cpu",
+    num_workers: int = 1,
+):
+    """Train a single fold (1-based) end-to-end: train → evaluate → save per-fold results.
+
+    Designed to be called from parallel_train.py as a subprocess. Each fold
+    writes to models/sliding/fold_N/ with no cross-fold dependencies.
+    """
+    import os
+    import time
+
+    # ── Thread allocation: prevent CPU oversubscription ────────────────────
+    # Each parallel worker must limit its threads to floor(28 / num_workers).
+    # Without this, every subprocess grabs all 28 cores → thrashing.
+    n_cpus = os.cpu_count() or 28
+    threads_per_worker = max(1, n_cpus // num_workers)
+    os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
+    os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+    # Also limit intra-op parallelism for small matrix ops.
+    # set_num_interop_threads must be called before any parallel work;
+    # if it fails (already initialized), we just set intra-op threads.
+    try:
+        import torch
+        torch.set_num_threads(threads_per_worker)
+    except (RuntimeError, AttributeError):
+        pass
+
+    k = fold_num  # 1-based
+    print(f"\n{'=' * 72}")
+    print(f"  SINGLE FOLD MODE — fold {k}  |  device={device}  n_envs={n_envs}"
+          f"  threads={threads_per_worker}  workers={num_workers}")
+    print(f"{'=' * 72}")
+
+    t0 = time.time()
+    m1, feature_cols, tr, va, te, _n_folds = _get_fold_data(k - 1)
+    print(f"  Data loaded in {time.time() - t0:.1f}s"
+          f"  | train {len(tr):,}  val {len(va):,}  test {len(te):,} bars"
+          f"  | TEST {te.index.min().date()}→{te.index.max().date()}")
+
+    fold_dir = str(Path(out_dir) / "sliding" / f"fold_{k}")
+    eval_freq_k = max(25_000, total_timesteps // target_evals_per_fold)
+
+    # Train
+    t1 = time.time()
+    model, vp = train(
+        total_timesteps=total_timesteps,
+        seed=seed,
+        out_dir=fold_dir,
+        train_episode_steps=train_episode_steps,
+        eval_freq=eval_freq_k,
+        dd_penalty=dd_penalty,
+        n_envs=n_envs,
+        device=device,
+        reveal_test=False,
+        datasets=(m1, feature_cols, tr, va, te),
+    )
+    train_time = time.time() - t1
+
+    # Evaluate on val and test
+    t2 = time.time()
+    model, vp = _load_fold_model(fold_dir)
+    val_rep = evaluate_on_split(model, vp, m1, feature_cols, va)
+    test_eq, test_trades, test_rep = _rollout_on_split(model, vp, m1, feature_cols, te)
+
+    # Save per-fold test equity and trades
+    if test_eq is not None and not test_eq.empty:
+        test_eq.to_csv(Path(fold_dir) / "test_equity.csv", index=False)
+    if test_trades is not None and not test_trades.empty:
+        test_trades.to_csv(Path(fold_dir) / "test_trades.csv", index=False)
+
+    eval_time = time.time() - t2
+    total_time = time.time() - t0
+
+    print(f"\n  ── Fold {k} COMPLETE ({total_time:.0f}s total, {train_time:.0f}s train, {eval_time:.0f}s eval) ──")
+    print(f"  VAL  : return={val_rep.get('total_return_pct'):+.1f}%  "
+          f"PF={val_rep.get('profit_factor'):.2f}  "
+          f"Sharpe={val_rep.get('sharpe_like'):+.2f}")
+    print(f"  TEST : return={test_rep.get('total_return_pct'):+.1f}%  "
+          f"PF={test_rep.get('profit_factor'):.2f}  "
+          f"Sharpe={test_rep.get('sharpe_like'):+.2f}  "
+          f"trades={test_rep.get('n_trades')}")
+
+    # Write summary row for this fold
+    summary_row = {
+        "fold": k,
+        "train_start": tr.index.min().date(), "train_end": tr.index.max().date(),
+        "test_start": te.index.min().date(), "test_end": te.index.max().date(),
+        "val_return_pct": val_rep.get("total_return_pct"),
+        "val_profit_factor": val_rep.get("profit_factor"),
+        "test_return_pct": test_rep.get("total_return_pct"),
+        "test_sharpe": test_rep.get("sharpe_like"),
+        "test_profit_factor": test_rep.get("profit_factor"),
+        "test_win_rate_pct": test_rep.get("win_rate_pct"),
+        "test_max_dd_pct": test_rep.get("max_drawdown_pct"),
+        "test_avg_r": test_rep.get("avg_r"),
+        "test_n_trades": test_rep.get("n_trades"),
+    }
+    summary_path = Path(fold_dir) / "fold_summary.json"
+    summary_path.write_text(json.dumps(summary_row, indent=2, default=str))
+
+    print(f"  Summary → {summary_path}")
+    return summary_row
+
+
 if __name__ == "__main__":
-    # Default entry point: sliding-window walk-forward (realistic retrain
-    # simulation; stitches a continuous out-of-sample test track record).
-    # For the block-fold scheme call train_walk_forward(); for a single
-    # chronological split call train() directly.
-    train_sliding_walk_forward()
+    import argparse
+    ap = argparse.ArgumentParser(description="Sliding-window walk-forward training")
+    ap.add_argument("--start-fold", type=int, default=1,
+                    help="Skip folds before this one (resume support)")
+    ap.add_argument("--fold", type=int, default=None,
+                    help="Train a single fold (1-based). Ignores --start-fold.")
+    ap.add_argument("--n-envs", type=int, default=None,
+                    help="Override number of parallel envs (default: 16)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Override device: 'cpu' or 'cuda:0' (default: cpu)")
+    ap.add_argument("--num-workers", type=int, default=1,
+                    help="Total parallel workers (for OMP thread allocation). "
+                         "Set to N when launching N parallel fold processes.")
+    args = ap.parse_args()
+
+    if args.fold is not None:
+        # Single-fold mode: train one fold and exit.
+        train_single_fold(
+            fold_num=args.fold,
+            n_envs=args.n_envs or 4,
+            device=args.device or "cpu",
+            num_workers=args.num_workers,
+        )
+    else:
+        # Sequential mode: train all folds from start_fold onwards.
+        train_sliding_walk_forward(
+            start_fold=args.start_fold,
+            n_envs=args.n_envs or 16,
+            device=args.device or "cpu",
+        )

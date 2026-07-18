@@ -1,0 +1,46 @@
+# Data (large CSVs — attach as release assets or use Git LFS)
+data/
+
+# Trained models and artifacts
+models/
+
+# Logs
+logs/
+*.log
+
+# Outputs (charts, HTML reports)
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts (generated)
+models/sliding_oos_equity.csv
+models/sliding_walk_forward_summary.csv
+models/eval_logs/
+models/best_model/
+agents.md

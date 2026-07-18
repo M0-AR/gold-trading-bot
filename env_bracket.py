@@ -84,6 +84,13 @@ class BracketTradingEnv(gym.Env):
         self._m1_low   = self.m1_df["Low"].to_numpy(dtype=np.float64)
         self._m1_index = self.m1_df.index  # DatetimeIndex (sorted, tz-aware)
 
+        # Pre-extract decision-frame columns as numpy arrays to eliminate
+        # pandas iloc / Series overhead from the hot step() loop.
+        self._feature_matrix = self.decision_df[self.feature_cols].to_numpy(dtype=np.float32)
+        self._close_array    = self.decision_df["Close"].to_numpy(dtype=np.float64)
+        self._atr_array      = self.decision_df["atr"].to_numpy(dtype=np.float64)
+        self._decision_index = self.decision_df.index  # cached for O(1) time lookups
+
         self.action_space = spaces.MultiDiscrete([3, len(self.sl_atr_multipliers), len(self.tp_r_multipliers)])
 
         # Market features + position state.
@@ -125,9 +132,8 @@ class BracketTradingEnv(gym.Env):
         return self.decision_df.index[min(self.i + 1, len(self.decision_df) - 1)]
 
     def _position_state_features(self) -> np.ndarray:
-        row = self._current_row()
-        close = float(row["Close"])
-        atr = max(float(row["atr"]), 1e-12)
+        close = self._close_array[self.i]
+        atr = max(self._atr_array[self.i], 1e-12)
         p = self.position
         if p.direction == 0:
             return np.array([0, 0, 0, 0, 0, 0], dtype=np.float32)
@@ -146,8 +152,7 @@ class BracketTradingEnv(gym.Env):
         ], dtype=np.float32)
 
     def _observation(self):
-        row = self._current_row()
-        market = row[self.feature_cols].astype(float).to_numpy(dtype=np.float32)
+        market = self._feature_matrix[self.i]  # direct numpy indexing (no pandas)
         pos = self._position_state_features()
         obs = np.concatenate([market, pos]).astype(np.float32)
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -161,9 +166,8 @@ class BracketTradingEnv(gym.Env):
         return price - direction * (self.spread_price / 2.0 + self.slippage_price)
 
     def _open_position(self, direction: int, sl_idx: int, tp_idx: int):
-        row = self._current_row()
-        close = float(row["Close"])
-        atr = max(float(row["atr"]), 1e-12)
+        close = self._close_array[self.i]
+        atr = max(self._atr_array[self.i], 1e-12)
         sl_atr_mult = self.sl_atr_multipliers[sl_idx]
         sl_dist = max(sl_atr_mult * atr, 1e-8)
         tp_r = self.tp_r_multipliers[tp_idx]
@@ -220,7 +224,9 @@ class BracketTradingEnv(gym.Env):
 
         Uses DatetimeIndex.searchsorted (O log n) + pre-cached numpy arrays to
         avoid a full pandas boolean-mask scan on each step (~100-200x faster on
-        a multi-year M1 dataset).
+        a multi-year M1 dataset).  The inner loop is fully vectorized: SL/TP
+        hit masks are computed in one numpy pass, and the first hit is located
+        with argmax — no Python for-loop over the M1 bars.
         """
         p = self.position
         if p.direction == 0:
@@ -233,28 +239,31 @@ class BracketTradingEnv(gym.Env):
         lo = int(self._m1_index.searchsorted(start, side="right"))
         hi = int(self._m1_index.searchsorted(end,   side="right"))
 
-        realized = 0.0
-        for idx in range(lo, hi):
-            high = self._m1_high[idx]
-            low  = self._m1_low[idx]
-            p = self.position
-            if p.direction == 0:
-                break
-            if p.direction == 1:
-                sl_hit = low  <= p.sl
-                tp_hit = high >= p.tp
-            else:
-                sl_hit = high >= p.sl
-                tp_hit = low  <= p.tp
+        if lo >= hi:
+            return 0.0
 
-            # Pessimistic intrabar rule: if both touched, assume SL first.
-            if sl_hit:
-                realized += self._close_position(p.sl, self._m1_index[idx], "SL")
-                break
-            if tp_hit:
-                realized += self._close_position(p.tp, self._m1_index[idx], "TP")
-                break
-        return realized
+        # Vectorized SL/TP detection — no Python for-loop.
+        highs = self._m1_high[lo:hi]
+        lows  = self._m1_low[lo:hi]
+
+        if p.direction == 1:  # Long
+            sl_hits = lows  <= p.sl
+            tp_hits = highs >= p.tp
+        else:                 # Short
+            sl_hits = highs >= p.sl
+            tp_hits = lows  <= p.tp
+
+        # Find the FIRST hit of each type.
+        sl_first = int(np.argmax(sl_hits)) if sl_hits.any() else -1
+        tp_first = int(np.argmax(tp_hits)) if tp_hits.any() else -1
+
+        # Pessimistic intrabar rule: if both touched on the same bar, assume SL.
+        if sl_first >= 0 and (tp_first < 0 or sl_first <= tp_first):
+            return self._close_position(p.sl, self._m1_index[lo + sl_first], "SL")
+        if tp_first >= 0:
+            return self._close_position(p.tp, self._m1_index[lo + tp_first], "TP")
+
+        return 0.0
 
     def step(self, action):
         action = np.asarray(action, dtype=int)
@@ -263,8 +272,7 @@ class BracketTradingEnv(gym.Env):
 
         prev_equity = self.equity
         reward_risk_unit = max(prev_equity * self.risk_fraction, 1e-12)
-        row = self._current_row()
-        close = float(row["Close"])
+        close = self._close_array[self.i]
 
         # Handle explicit close or flip at current decision close.
         if self.position.direction != 0:
@@ -289,7 +297,7 @@ class BracketTradingEnv(gym.Env):
         # the trade is open, without leaking any future price information.
         if self.position.direction != 0:
             self.position.bars_in_trade += 1
-            current_close = float(self.decision_df.iloc[self.i]["Close"])
+            current_close = self._close_array[self.i]
             unrealized = (current_close - self.position.entry_price) * self.position.units * self.position.direction
         else:
             unrealized = 0.0
