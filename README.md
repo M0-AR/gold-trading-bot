@@ -4,6 +4,8 @@ A reproducible walk-forward research pipeline for training PPO agents on XAUUSD 
 
 **Status**: Research prototype — not for live trading.
 
+> **Based on**: [ZiadFrancis/Reinforcement_Trading_Part_2](https://github.com/ZiadFrancis/Reinforcement_Trading_Part_2) — the original pipeline architecture and environment design. We trained independently from scratch and extended the pipeline with parallel training, resume support, and performance optimizations. All results below are from our own runs.
+
 ## Highlights
 
 - **25 causal technical features** — ATR-normalized indicators, session flags, time features; no future leakage
